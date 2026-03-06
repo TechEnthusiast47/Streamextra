@@ -1,9 +1,8 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import RedirectResponse
 import requests
 import re
 import time
-from org.mozilla.javascript import Context  # pas disponible sur Render, on simule avec requests
+from urllib.parse import urlparse
 
 app = FastAPI(title="Streamtape Extractor - Amagno Zone Grise 😈")
 
@@ -11,41 +10,76 @@ UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.1
 
 @app.get("/extract")
 async def extract(url: str):
-    if not "streamtape" in url:
-        raise HTTPException(400, "Donne un lien Streamtape valide")
+    if not url.startswith("https://streamtape"):
+        raise HTTPException(400, "Balance un vrai lien Streamtape, pas de blague")
+
+    print(f"Extraction pour : {url}")
 
     try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
+        # Fetch la page avec UA mobile + Referer
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://streamtape.com/"
+        }
+        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         html = r.text
 
-        # Recherche du script JS obfuscé (comme dans CloudStream)
-        script_match = re.search(r'<script[^>]*>(.*?get_player.*?</script>)', html, re.DOTALL)
-        if not script_match:
-            raise ValueError("Pas de script get_player trouvé")
+        print(f"Page fetchée (status {r.status_code}), taille HTML: {len(html)} octets")
 
-        script = script_match.group(1)
+        # Regex 2026 plus large (inspiré CloudStream + tests récents)
+        patterns = [
+            r"get_player\('([^']+)'\)",               # pattern classique
+            r"file:\s*[\"']([^\"']+)\"",              # file: "url"
+            r"src=[\"']([^\"']+\.(mp4|m3u8))[\"']",   # src="...mp4"
+            r"'([^']*?get_video[^']*?)'",             # get_video dans JS
+            r"var\s+url\s*=\s*[\"']([^\"']+)\"",      # var url = "..."
+            r"id=\"videolink\"[^>]*href=[\"']([^\"']+)",  # videolink href
+        ]
 
-        # Extrait l'argument get_player (simplifié, pas Rhino sur Render)
-        arg_match = re.search(r"get_player`\('([^']+)'\)`", script)
-        if arg_match:
-            arg = arg_match.group(1)
-            # Construit le lien (comme dans CloudStream)
-            video_url = f"https://stape.fun/get_video?id={arg}&stream=1"
+        match = None
+        for pattern in patterns:
+            m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+            if m:
+                match = m.group(1)
+                print(f"Match trouvé avec pattern : {pattern}")
+                break
 
-            # Bypass timer
-            time.sleep(10)
+        if not match:
+            # Dump un bout du HTML pour debug
+            debug_html = html[:1000] + "..." + html[-1000:]
+            print(f"Aucun match - HTML snippet : {debug_html}")
+            raise ValueError("Aucun lien vidéo détecté - Streamtape a changé son code (regarde les logs Render)")
 
-            # Follow redirect
-            r2 = requests.get(video_url, headers={"Referer": url}, allow_redirects=True, timeout=15)
-            final_url = r2.url
+        # Nettoyage du lien (parfois relatif)
+        if match.startswith("/"):
+            parsed = urlparse(url)
+            match = f"{parsed.scheme}://{parsed.netloc}{match}"
 
-            return {"status": "success", "direct_link": final_url}
+        print(f"Lien extrait : {match}")
 
-        raise ValueError("Aucun argument get_player trouvé")
+        # Bypass timer pub (obligatoire)
+        print("Attente 10s pour bypass timer...")
+        time.sleep(10)
+
+        # Follow redirect avec Referer
+        r2 = requests.get(match, headers={"Referer": url}, allow_redirects=True, timeout=15)
+        final_url = r2.url
+
+        print(f"Redirect final : {final_url}")
+
+        if ".mp4" not in final_url and ".m3u8" not in final_url:
+            raise ValueError(f"Lien final pas valide : {final_url}")
+
+        return {
+            "status": "success",
+            "original_url": url,
+            "direct_link": final_url
+        }
 
     except Exception as e:
-        raise HTTPException(500, str(e))
+        print(f"Erreur extraction : {str(e)}")
+        raise HTTPException(500, detail=str(e))
 
 @app.get("/")
 async def root():
-    return {"message": "Streamtape Extractor - utilise /extract?url=ton-lien"}
+    return {"message": "Streamtape Extractor by Amagno – utilise /extract?url=ton-lien-streamtape"}
